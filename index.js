@@ -9,15 +9,27 @@ app.use(express.json());
 
 app.use(cors());
 
-app.get('/ping', (req, res) => {
+app.get('/api/ping', (req, res) => {
 	res.json({
 		message: 'pong'
 	});
 });
 
+app.get('/', (req, res) => res.send('inferless socket server'));
+
+const allowedOrigins = ['http://localhost:3000', 'https://console-dev.inferless.com'];
+
 const socketIO = require('socket.io')(http, {
 	cors: {
-		origin: 'http://localhost:3000'
+		origin: (origin, callback) => {
+			if (!origin || allowedOrigins.includes(origin)) {
+				callback(null, true); // Allow the connection
+			} else {
+				callback(new Error('CORS policy violation')); // Block the connection
+			}
+		},
+		methods: ['GET', 'POST'], // Allowed methods
+		credentials: true // If credentials are required
 	}
 });
 
