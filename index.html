@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Model Log Viewer (pilot)</title>
+  <style>
+    body { font-family: monospace; margin: 1rem; background: #f5f7fa; }
+    #out { height: 90vh; overflow: auto; border: 1px solid #888; padding: .5rem; background: #000; color: #0f0; }
+    button { margin: 0 .5rem; }
+  </style>
+</head>
+<body>
+  <h3>
+    Choose model&nbsp;
+    <select id="sel">
+      <option value="mdl-999">mdl-999</option>
+      <option value="mdl-abc">mdl-abc</option>
+      <option value="mdl-build-42">mdl-build-42</option>
+    </select>
+    <button id="btnStart">Start</button>
+    <button id="btnStop">Stop</button>
+    <button id="btnDisconnect">Disconnect</button>
+  </h3>
+  <pre id="out">— not connected —</pre>
+
+  <script>
+    // Replace these with your real values
+    const WSS_URL = "wss://ws.inferless.com/";
+    const TOKEN   = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c3ItMTIzIiwiaWF0IjoxNzQ1Mzk3NjQ2fQ.wi2NXVncAj29PGTaPfQTlIbpNMVyM_ScpUWUpZWvI2M";
+
+    const ws = new WebSocket(`${WSS_URL}?token=${TOKEN}`);
+    const out = document.getElementById("out");
+    const sel = document.getElementById("sel");
+    const btnStart      = document.getElementById("btnStart");
+    const btnStop       = document.getElementById("btnStop");
+    const btnDisconnect = document.getElementById("btnDisconnect");
+
+    ws.onopen = () => log("🌐 socket open");
+    ws.onclose = () => log("🔌 socket closed");
+    ws.onerror = e => log("⚠️ socket error:", e);
+
+    ws.onmessage = ev => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return log("«", ev.data);
+      }
+      // Acknowledgment messages
+      if (msg.ack) {
+        log("✅", msg.ack, msg.modelId || "");
+      }
+      // Batch of logs (real-time arrays)
+      else if (Array.isArray(msg)) {
+        msg.forEach(l => log(`${l.timestamp} | ${l.modelId} | ${l.message}`));
+      }
+      // Single log object (back-fill sends one-by-one)
+      else if (msg.modelId && msg.message) {
+        log(`${msg.timestamp} | ${msg.modelId} | ${msg.message}`);
+      }
+    };
+
+    btnStart.onclick = () => {
+      const model = sel.value;
+      ws.send(JSON.stringify({ action: "streamLogs", modelId: model }));
+      log(`▶ Start streaming: ${model}`);
+    };
+
+    btnStop.onclick = () => {
+      ws.send(JSON.stringify({ action: "stopStream" }));
+      log("▶ Stopped streaming");
+    };
+
+    btnDisconnect.onclick = () => {
+      ws.send(JSON.stringify({ action: "stopStream" }));
+      ws.close();
+    };
+
+    // Optional: auto-disconnect on window/tab close
+    window.addEventListener("beforeunload", () => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: "stopStream" }));
+        ws.close();
+      }
+    });
+
+    function log(...parts) {
+      out.textContent += parts.join(" ") + "\n";
+      out.scrollTop = out.scrollHeight;
+    }
+  </script>
+</body>
+</html>
