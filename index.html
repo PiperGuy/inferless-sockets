@@ -76,13 +76,15 @@
       ws.close();
     };
 
-    // Optional: auto-disconnect on window/tab close
-    window.addEventListener("beforeunload", () => {
+    // Gracefully stop stream and close socket on page unload/reload
+    function gracefulShutdown() {
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ action: "stopStream" }));
+        try { ws.send(JSON.stringify({ action: "stopStream" })); } catch {}
         ws.close();
       }
-    });
+    }
+    window.addEventListener("beforeunload", gracefulShutdown);
+    window.addEventListener("unload", gracefulShutdown);
 
     function log(...parts) {
       out.textContent += parts.join(" ") + "\n";

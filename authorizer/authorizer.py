@@ -37,18 +37,6 @@ def handler(event, _ctx):
             options={"verify_iss": bool(ISS), "verify_aud": bool(AUD)},
         )
 
-        # # Everything passed – build a SIMPLE RESPONSE for API Gateway v2
-        # return {
-        #     "isAuthorized": True,
-        #     "context": {
-        #         "userId": payload.get("sub", ""),
-        #         # Include anything else you want to forward to $connect route:
-        #         "roles": ",".join(payload.get("roles", [])),
-        #     },
-        # }
-        # --- everything above this line stays the same ---
-
-        # Build a STANDARD response for WebSocket APIs
         principal = payload.get("sub", "anonymous")
 
         return {
