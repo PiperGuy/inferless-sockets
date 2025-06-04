@@ -31,8 +31,7 @@ def handler(event, _ctx):
         profile_url = f"{ENDPOINT}/users/profile"
         headers = {"Authorization": f"Bearer {token}"}
 
-        response = requests.post(profile_url, headers=headers)
-        print(response.json())
+        response = requests.get(profile_url, headers=headers)
         data = response.json()
 
         # Check if the response status is success

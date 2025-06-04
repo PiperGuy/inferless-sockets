@@ -26,20 +26,33 @@ def handler(event, context):
         log.info("Connected: %s (user %s)", cid, user)
         return {"statusCode": 200, "body": "connected"}
 
-    # 2) streamLogs: record the desired modelId and notify consumer for back-fill
+    # 2) streamLogs: record the desired identifierId and notify consumer for back-fill
     if route == "streamLogs":
         body = json.loads(event.get("body", "{}"))
-        model = body.get("modelId")
-        if not model:
-            return {"statusCode": 400, "body": "modelId required"}
+        identifiers = body.get("identifierId")
+        if not identifiers:
+            return {"statusCode": 400, "body": "identifierId required"}
+
+        # Ensure identifiers is always a list
+        if not isinstance(identifiers, list):
+            identifiers = [identifiers]
+
+        # Store as a string list in DynamoDB
+        identifier_items = [{"S": identifier} for identifier in identifiers]
+
+        # Use the first identifier as the GSI key (required to be a string)
+        first_identifier = identifiers[0] if identifiers else ""
 
         ddb.update_item(
             TableName=TABLE,
             Key=pk,
-            UpdateExpression="SET modelId = :m",
-            ExpressionAttributeValues={":m": {"S": model}},
+            UpdateExpression="SET identifierId = :ids, identifierIdGSI = :first_id",
+            ExpressionAttributeValues={
+                ":ids": {"L": identifier_items},
+                ":first_id": {"S": first_identifier},
+            },
         )
-        log.info("Subscribed: %s → %s", cid, model)
+        log.info("Subscribed: %s → %s", cid, identifiers)
 
         # Notify the Consumer Lambda for back-fill
         if CONSUMER_ARN:
@@ -47,7 +60,7 @@ def handler(event, context):
                 "type": "control",
                 "action": "set",
                 "connectionId": cid,
-                "modelId": model,
+                "identifierId": identifiers,
             }
             lambdacli.invoke(
                 FunctionName=CONSUMER_ARN,
@@ -55,11 +68,18 @@ def handler(event, context):
                 Payload=json.dumps(payload).encode(),
             )
 
-        return {"statusCode": 200, "body": json.dumps({"ack": "OK", "modelId": model})}
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ack": "OK", "identifierId": identifiers}),
+        }
 
     # 3) stopStream: clear the subscription and notify consumer
     if route == "stopStream":
-        ddb.update_item(TableName=TABLE, Key=pk, UpdateExpression="REMOVE modelId")
+        ddb.update_item(
+            TableName=TABLE,
+            Key=pk,
+            UpdateExpression="REMOVE identifierId, identifierIdGSI",
+        )
         log.info("Unsubscribed: %s", cid)
 
         if CONSUMER_ARN:

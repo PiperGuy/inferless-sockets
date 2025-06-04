@@ -21,6 +21,10 @@ GSI = "identifier-index"
 # In-memory subscription map: connectionId -> identifierId list
 IDENTIFIER_FILTER: dict[str, list[str]] = {}
 
+# In-memory log deduplication cache: connectionId -> set of processed log hashes
+LOG_DEDUP_CACHE: dict[str, set[str]] = {}
+MAX_CACHE_SIZE = 1000  # Maximum number of log hashes to keep per connection
+
 # Logging setup
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -53,8 +57,45 @@ def _decode_data(raw_data):
         decoded = base64.b64decode(text)
         return json.loads(decoded)
     except Exception:
-        log.warning("Failed to decode record Data")
+        log.warning("Failed to decode record Data for backfill")
         return None
+
+
+def _generate_log_hash(log_data):
+    """Generate a hash for a log entry to detect duplicates."""
+    if isinstance(log_data, dict):
+        # Hash based on content, time, and identifier if available
+        log_content = log_data.get("log", "")
+        timestamp = log_data.get("time", "")
+        identifier = log_data.get("identifierId", "")
+        hash_input = f"{log_content}:{timestamp}:{identifier}"
+        return hash(hash_input)
+    return hash(str(log_data))
+
+
+def _is_duplicate_log(cid, log_data):
+    """Check if this log has already been sent to this connection."""
+    # Initialize dedup cache for this connection if needed
+    if cid not in LOG_DEDUP_CACHE:
+        LOG_DEDUP_CACHE[cid] = set()
+
+    # Generate a hash for this log
+    log_hash = _generate_log_hash(log_data)
+
+    # Check if we've seen this log before
+    if log_hash in LOG_DEDUP_CACHE[cid]:
+        return True
+
+    # Add to cache for future checks
+    LOG_DEDUP_CACHE[cid].add(log_hash)
+
+    # Limit cache size to prevent memory growth
+    if len(LOG_DEDUP_CACHE[cid]) > MAX_CACHE_SIZE:
+        # Remove oldest entries (approximate by converting to list, but works for our purpose)
+        cache_list = list(LOG_DEDUP_CACHE[cid])
+        LOG_DEDUP_CACHE[cid] = set(cache_list[-MAX_CACHE_SIZE:])
+
+    return False
 
 
 def _process_control(payload: dict):
@@ -67,6 +108,9 @@ def _process_control(payload: dict):
         if not isinstance(identifiers, list):
             identifiers = [identifiers]
 
+        # Log the exact format of identifiers received
+        log.info("RECEIVED IDENTIFIERS: %s (type: %s)", identifiers, type(identifiers))
+
         # Skip if empty list
         if not identifiers:
             log.warning("Empty identifierId list for connection %s, skipping", cid)
@@ -75,81 +119,184 @@ def _process_control(payload: dict):
         IDENTIFIER_FILTER[cid] = identifiers
         log.info("Subscribed %s → %s", cid, identifiers)
 
+        # Clear deduplication cache for this connection
+        LOG_DEDUP_CACHE.pop(cid, {})
+
         # Back-fill: read all shards from TRIM_HORIZON to now
         try:
             shards = kinesis.describe_stream(StreamName=STREAM)["StreamDescription"][
                 "Shards"
             ]
-            log.info("Starting backfill for identifiers: %s", identifiers)
+
+            log.info(
+                "Starting backfill for identifiers: %s (Stream: %s)",
+                identifiers,
+                STREAM,
+            )
             log.info("Found %d shards in stream", len(shards))
+            backfill_count = 0
+            processed_count = 0
 
-            for shard in shards:
-                shard_id = shard["ShardId"]
-                log.info("Processing shard: %s", shard_id)
+            for shard_idx, shard in enumerate(shards):
+                log.info(
+                    "Processing shard %d/%d: %s",
+                    shard_idx + 1,
+                    len(shards),
+                    shard["ShardId"],
+                )
+                try:
+                    it = kinesis.get_shard_iterator(
+                        StreamName=STREAM,
+                        ShardId=shard["ShardId"],
+                        ShardIteratorType="TRIM_HORIZON",
+                    )["ShardIterator"]
 
-                # Get shard iterator
-                it = kinesis.get_shard_iterator(
-                    StreamName=STREAM,
-                    ShardId=shard_id,
-                    ShardIteratorType="TRIM_HORIZON",
-                )["ShardIterator"]
+                    iteration = 0
+                    shard_records = 0
 
-                # Process records from shard
-                while it:
-                    resp = kinesis.get_records(ShardIterator=it, Limit=1000)
-                    it = resp.get("NextShardIterator")
-                    records = resp.get("Records", [])
+                    while it:
+                        iteration += 1
+                        resp = kinesis.get_records(ShardIterator=it, Limit=1000)
+                        it = resp.get("NextShardIterator")
+                        records = resp.get("Records", [])
+                        shard_records += len(records)
 
-                    if not records:
-                        break
+                        if iteration % 10 == 0:
+                            log.info(
+                                "Processed %d iterations, %d records so far in shard %s",
+                                iteration,
+                                shard_records,
+                                shard["ShardId"],
+                            )
 
-                    for rec in records:
-                        logdata = _decode_data(rec.get("Data"))
-                        if not logdata:
-                            continue
+                        if not records:
+                            log.info("No more records in shard %s", shard["ShardId"])
+                            break
 
-                        # Check if record matches any subscribed identifier
-                        record_id = logdata.get("identifierId")
-                        if not record_id:
-                            continue
-
-                        # Handle both string and list cases
-                        record_ids = (
-                            record_id if isinstance(record_id, list) else [record_id]
-                        )
-
-                        # Check if any record ID matches any subscribed ID
-                        if any(
-                            str(rid).strip() == str(sub_id).strip()
-                            for rid in record_ids
-                            for sub_id in identifiers
-                        ):
+                        for rec in records:
+                            processed_count += 1
                             try:
-                                # Process log before sending
-                                processed_log = extract_log_item(logdata)
-                                mgmt.post_to_connection(
-                                    ConnectionId=cid,
-                                    Data=json.dumps(processed_log).encode(),
+                                logdata = _decode_data(rec.get("Data"))
+                                if not logdata:
+                                    log.debug("Skipping record - couldn't decode data")
+                                    continue
+
+                                # Print a sample of what we're seeing
+                                if processed_count <= 5:
+                                    log.info(
+                                        "SAMPLE RECORD: %s", json.dumps(logdata)[:200]
+                                    )
+
+                                # Check if the record's identifierId is in the subscription list
+                                record_id = logdata.get("identifierId")
+
+                                # Debug every record for troubleshooting
+                                log.info(
+                                    "Checking record with ID: %s against subscriptions: %s",
+                                    record_id,
+                                    identifiers,
                                 )
-                            except mgmt.exceptions.GoneException:
-                                log.warning("Connection %s gone during backfill", cid)
-                                IDENTIFIER_FILTER.pop(cid, None)
-                                return
+
+                                # Debug check for first few records
+                                if processed_count <= 20:
+                                    log.info(
+                                        "Record %d has identifierId: %s",
+                                        processed_count,
+                                        record_id,
+                                    )
+
+                                if not record_id:
+                                    log.debug("Skipping record with no identifierId")
+                                    continue
+
+                                # Handle both string and list cases
+                                record_ids = (
+                                    record_id
+                                    if isinstance(record_id, list)
+                                    else [record_id]
+                                )
+
+                                # For each ID in our subscription, check if it matches any ID in the record
+                                match_found = False
+                                for sub_id in identifiers:
+                                    for rid in record_ids:
+                                        # Try multiple matching approaches
+                                        if str(sub_id).strip() == str(rid).strip():
+                                            match_found = True
+                                            log.info(
+                                                "MATCH FOUND (exact): %s == %s",
+                                                sub_id,
+                                                rid,
+                                            )
+                                            break
+                                        # Try case-insensitive match
+                                        elif (
+                                            str(sub_id).strip().lower()
+                                            == str(rid).strip().lower()
+                                        ):
+                                            match_found = True
+                                            log.info(
+                                                "MATCH FOUND (case-insensitive): %s == %s",
+                                                sub_id,
+                                                rid,
+                                            )
+                                            break
+                                    if match_found:
+                                        break
+
+                                if match_found:
+                                    try:
+                                        log.info("Sending matched record to %s", cid)
+                                        # Process log through extract_log_item before sending
+                                        processed_log = extract_log_item(logdata)
+
+                                        # Skip if this is a duplicate log
+                                        if _is_duplicate_log(cid, processed_log):
+                                            log.info(
+                                                "Skipping duplicate log for %s", cid
+                                            )
+                                            continue
+
+                                        mgmt.post_to_connection(
+                                            ConnectionId=cid,
+                                            Data=json.dumps(processed_log).encode(),
+                                        )
+                                        backfill_count += 1
+                                    except mgmt.exceptions.GoneException:
+                                        log.warning(
+                                            "Connection %s gone during backfill", cid
+                                        )
+                                        IDENTIFIER_FILTER.pop(cid, None)
+                                        return
+                                    except Exception as e:
+                                        log.error(
+                                            "Error sending backfill to %s: %s",
+                                            cid,
+                                            str(e),
+                                        )
                             except Exception as e:
-                                log.error(
-                                    "Error sending backfill to %s: %s", cid, str(e)
-                                )
+                                log.error("Error processing record: %s", str(e))
 
-                    # Throttle to avoid Kinesis limits
-                    sleep(0.1)
+                        # throttle to avoid Kinesis limits
+                        sleep(0.1)
+                except Exception as e:
+                    log.error("Error processing shard %s: %s", shard["ShardId"], str(e))
 
-            log.info("Back-fill complete for %s → %s", cid, identifiers)
+            log.info(
+                "Back-fill complete for %s → %s, processed %d records, sent %d matching records",
+                cid,
+                identifiers,
+                processed_count,
+                backfill_count,
+            )
         except Exception as e:
             log.error("Backfill error for %s: %s", cid, str(e))
 
     elif action == "drop":
         if cid in IDENTIFIER_FILTER:
             IDENTIFIER_FILTER.pop(cid, None)
+            # Also clear deduplication cache
+            LOG_DEDUP_CACHE.pop(cid, None)
             log.info("Unsubscribed %s", cid)
 
 
@@ -162,7 +309,6 @@ def _process_kinesis(event):
             logs.append(json.loads(data))
         except Exception:
             log.warning("Skipping invalid realtime record")
-
     log.info("Real-time batch: %d records", len(logs))
 
     # Group logs by identifier
@@ -190,7 +336,7 @@ def _process_kinesis(event):
             continue
 
         try:
-            # Query DynamoDB for connections subscribed to this identifier
+            # First try a direct query on the GSI for exact matches on the first identifier
             resp = ddb.query(
                 TableName=TABLE,
                 IndexName=GSI,
@@ -198,7 +344,7 @@ def _process_kinesis(event):
                 ExpressionAttributeValues={":id": {"S": identifier}},
             )
 
-            # Get additional matches through filtering
+            # Get additional matches through filtering for identifiers in the list
             scan_resp = ddb.scan(
                 TableName=TABLE,
                 FilterExpression="contains(identifierId, :id) AND attribute_not_exists(identifierIdGSI)",
@@ -208,7 +354,7 @@ def _process_kinesis(event):
             # Combine results
             items = resp.get("Items", []) + scan_resp.get("Items", [])
 
-            # Send logs to each connection
+            # For each connection, send the logs
             for item in items:
                 cid = item["PK"]["S"].split("#", 1)[1]
                 try:
@@ -216,9 +362,16 @@ def _process_kinesis(event):
                     processed_logs = []
                     for log_item in identifier_logs:
                         processed_log = extract_log_item(log_item)
+
                         # Skip empty logs
-                        if processed_log.get("log", ""):
+                        if not processed_log.get("log", ""):
+                            continue
+
+                        # Skip duplicates
+                        if not _is_duplicate_log(cid, processed_log):
                             processed_logs.append(processed_log)
+                        else:
+                            log.info("Skipping duplicate real-time log for %s", cid)
 
                     if processed_logs:
                         mgmt.post_to_connection(
@@ -236,6 +389,8 @@ def _process_kinesis(event):
                         ddb.delete_item(
                             TableName=TABLE, Key={"PK": {"S": f"CONN#{cid}"}}
                         )
+                        # Also clean up deduplication cache
+                        LOG_DEDUP_CACHE.pop(cid, None)
                     except Exception as e:
                         log.error(
                             "Failed to delete gone connection %s: %s", cid, str(e)
